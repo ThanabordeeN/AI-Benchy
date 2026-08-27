@@ -1,0 +1,103 @@
+name: Release on Main
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build & Publish Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type Check
+        run: npm run type-check
+
+      - name: Download Neutralino Binaries
+        run: npx @neutralinojs/neu update
+
+      - name: Build Standalone Desktop Binaries
+        run: npm run neu:build
+
+      - name: Package Release Archives
+        id: package
+        run: |
+          mkdir -p release-assets
+          
+          # Linux packages
+          tar -czvf release-assets/ai-benchy-linux-x64.tar.gz -C dist/ai-benchy ai-benchy-linux_x64 resources.neu
+          tar -czvf release-assets/ai-benchy-linux-arm64.tar.gz -C dist/ai-benchy ai-benchy-linux_arm64 resources.neu
+          tar -czvf release-assets/ai-benchy-linux-armhf.tar.gz -C dist/ai-benchy ai-benchy-linux_armhf resources.neu
+
+          # macOS packages
+          tar -czvf release-assets/ai-benchy-mac-x64.tar.gz -C dist/ai-benchy ai-benchy-mac_x64 resources.neu
+          tar -czvf release-assets/ai-benchy-mac-arm64.tar.gz -C dist/ai-benchy ai-benchy-mac_arm64 resources.neu
+          tar -czvf release-assets/ai-benchy-mac-universal.tar.gz -C dist/ai-benchy ai-benchy-mac_universal resources.neu
+
+          # Windows package
+          zip -j release-assets/ai-benchy-windows-x64.zip dist/ai-benchy/ai-benchy-win_x64.exe dist/ai-benchy/resources.neu
+
+          # All-in-one bundle
+          cp dist/ai-benchy-release.zip release-assets/ai-benchy-all-platforms.zip
+
+          # Extract version from package.json
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            TAG_NAME="${GITHUB_REF#refs/tags/}"
+          else
+            TAG_NAME="v${PKG_VERSION}"
+          fi
+          echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+          echo "pkg_version=${PKG_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate Release Notes & Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.package.outputs.tag_name }}
+          name: AI-Benchy ${{ steps.package.outputs.tag_name }}
+          body: |
+            ## 🚀 AI-Benchy Release ${{ steps.package.outputs.tag_name }}
+
+            Native desktop standalone binaries and web app for `llama-benchy` benchmarking.
+
+            ### 📦 Download Assets:
+            - **Linux (x64)**: `ai-benchy-linux-x64.tar.gz`
+            - **Linux (ARM64)**: `ai-benchy-linux-arm64.tar.gz`
+            - **macOS (Universal - Apple Silicon & Intel)**: `ai-benchy-mac-universal.tar.gz`
+            - **macOS (Apple Silicon M1/M2/M3/M4)**: `ai-benchy-mac-arm64.tar.gz`
+            - **macOS (Intel)**: `ai-benchy-mac-x64.tar.gz`
+            - **Windows (x64)**: `ai-benchy-windows-x64.zip`
+            - **All Platforms Bundle**: `ai-benchy-all-platforms.zip`
+
+            ---
+            *Automated release generated on merge to `main`.*
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: release-assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

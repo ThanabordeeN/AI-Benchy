@@ -1,0 +1,83 @@
+name: Dev Pipeline
+
+on:
+  push:
+    branches:
+      - dev
+  workflow_dispatch:
+
+concurrency:
+  group: dev-pipeline-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dev-build:
+    name: Build & Package Development Artifacts
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type Check
+        run: npm run type-check
+
+      - name: Download Neutralino Binaries
+        run: npx @neutralinojs/neu update
+
+      - name: Build Neutralino Standalone Binaries
+        run: npm run neu:build
+
+      - name: Package Development Binaries
+        run: |
+          mkdir -p dev-packages
+          
+          # Linux x64
+          tar -czvf dev-packages/ai-benchy-linux-x64-dev.tar.gz -C dist/ai-benchy ai-benchy-linux_x64 resources.neu
+          
+          # Linux arm64
+          tar -czvf dev-packages/ai-benchy-linux-arm64-dev.tar.gz -C dist/ai-benchy ai-benchy-linux_arm64 resources.neu
+
+          # macOS Universal
+          tar -czvf dev-packages/ai-benchy-mac-universal-dev.tar.gz -C dist/ai-benchy ai-benchy-mac_universal resources.neu
+
+          # Windows x64
+          zip -j dev-packages/ai-benchy-windows-x64-dev.zip dist/ai-benchy/ai-benchy-win_x64.exe dist/ai-benchy/resources.neu
+
+          # Complete Bundle
+          cp dist/ai-benchy-release.zip dev-packages/ai-benchy-all-platforms-dev.zip
+
+      - name: Upload Dev Artifacts to GitHub Actions Run
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-benchy-dev-builds
+          path: dev-packages/*
+          retention-days: 14
+
+      - name: Publish Dev Pre-Release (Rolling Latest)
+        uses: softprops/action-gh-release@v2
+        if: github.ref == 'refs/heads/dev'
+        with:
+          tag_name: dev-latest
+          name: AI-Benchy Development Build (Latest)
+          body: |
+            ## 🚧 AI-Benchy Dev Build
+            Latest automated build from the `dev` branch.
+            - Commit: `${{ github.sha }}`
+            - Generated on: `${{ github.event.head_commit.timestamp || 'N/A' }}`
+          prerelease: true
+          make_latest: false
+          files: dev-packages/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

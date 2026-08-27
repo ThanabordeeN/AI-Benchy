@@ -1,0 +1,48 @@
+{
+  "$schema": "https://raw.githubusercontent.com/neutralinojs/neutralinojs/main/schemas/neutralino.config.schema.json",
+  "applicationId": "ai.runtime.aibenchy",
+  "version": "1.0.0",
+  "defaultMode": "window",
+  "port": 0,
+  "url": "/",
+  "documentRoot": "/resources/",
+  "enableServer": true,
+  "enableNativeAPI": true,
+  "logging": {
+    "enabled": true,
+    "writeToLogFile": false
+  },
+  "nativeAllowList": [
+    "app.*",
+    "os.*",
+    "window.*",
+    "filesystem.*",
+    "events.*"
+  ],
+  "modes": {
+    "window": {
+      "title": "llama-benchy | Apple-Styled LLM Benchmarker",
+      "width": 1320,
+      "height": 880,
+      "minWidth": 980,
+      "minHeight": 680,
+      "center": true,
+      "fullScreen": false,
+      "alwaysOnTop": false,
+      "enableInspector": true,
+      "borderless": false,
+      "maximize": false,
+      "hidden": false,
+      "resizable": true,
+      "useSavedState": true
+    }
+  },
+  "cli": {
+    "binaryName": "ai-benchy",
+    "resourcesPath": "/resources/",
+    "extensionsPath": "/extensions/",
+    "clientLibrary": "/resources/neutralino.js",
+    "binaryVersion": "5.6.0",
+    "clientVersion": "5.6.0"
+  }
+}
