@@ -17,12 +17,13 @@ A modern, Apple-styled (macOS Tahoe & iOS 18 design language) Next.js web applic
   - **Test Shapes**: Multi-token tag chips for `--pp` (prompt processing), `--tg` (generation), `--depth` (context depth sweep), `--concurrency` (parallel clients), and `--exact-tg`.
   - **Run Parameters**: `--runs`, `--warmup-runs`, `--no-warmup`.
   - **Latency & Prefix Caching**: `--latency-mode` (generation / api / none), `--enable-prefix-caching`, `--no-cache`, `--adapt-prompt`, `--skip-coherence`.
-  - **Dataset & Text**: Project Gutenberg book source, `--book-url`, `--dataset-file`.
-  - **Output & Timeseries**: `--format` (md / json / csv), `--save-result`, `--save-total-throughput-timeseries`, `--save-all-throughput-timeseries`, `--sample-interval`.
-  - **Advanced Hooks**: `--post-run-cmd`, `--extra-body`, `--exit-on-first-fail`, `--no-results-on-fail`, `--verbose`.
+  - **Dataset & Text**: Project Gutenberg book source, `--book-url`.
+  - **Output & Timeseries**: `--format` (md / json / csv), `--save-result`, `--save-total-throughput-timeseries`, `--save-all-throughput-timeseries`.
+  - **Advanced Hooks**: `--post-run-cmd`, `--extra-body`, `--exit-on-first-fail`, `--no-results-on-fail`.
 - **EvalScope Needle-In-A-Haystack**:
   - Full context retrieval accuracy testing across varying context lengths and depth percentages.
   - Interactive color-graded accuracy heatmaps, executive radar reports, and export capabilities.
+  - ⚠️ **Note**: the in-app runner uses a **built-in lightweight NIAH engine** (string-match scoring, approximate token counts). For official results (real EvalScope corpus + LLM-judge scoring), use the generated Python script from the *Python Script & SDK* tab with `pip install "evalscope[needle_bench]"`.
 - **Live Streaming & Real-Time HUD**:
   - Real-time Server-Sent Events (SSE) stream consuming `--emit-progress`.
   - Digital gauges for Prompt Processing Speed (`pp t/s`), Token Generation Speed (`tg t/s`), Time-To-First-Response (`TTFR ms`), and Peak Throughput.

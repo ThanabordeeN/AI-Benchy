@@ -382,34 +382,8 @@ export const ConfigPanel: React.FC<ConfigPanelProps> = ({ config, onChange }) =>
             </div>
           </GlassCard>
 
-          {/* Custom Dataset File */}
-          <GlassCard
-            title="Custom Local Dataset File"
-            subtitle="Provide your own benchmark text dataset from filesystem"
-            icon={<FileCode className="w-4 h-4" />}
-          >
-            <div className="flex flex-col gap-4">
-              <div className="flex flex-col gap-1.5">
-                <label className="text-xs font-semibold text-zinc-900 dark:text-zinc-100 flex items-center justify-between">
-                  <span>Dataset File Path (Plain Text)</span>
-                  <code className="text-[10px] font-mono text-apple-blue dark:text-apple-cyan bg-apple-blue/10 px-1.5 py-0.2 rounded">
-                    --dataset-file
-                  </code>
-                </label>
-                <input
-                  type="text"
-                  value={config.datasetFile}
-                  onChange={(e) => updateConfig('datasetFile', e.target.value)}
-                  placeholder="/path/to/my-custom-prompts.txt"
-                  className="w-full h-10 px-3.5 rounded-xl border border-black/10 dark:border-white/10 bg-white dark:bg-[#2c2c2e] text-xs font-mono text-zinc-900 dark:text-zinc-100 placeholder:text-zinc-400 focus:outline-none focus:ring-2 focus:ring-apple-blue shadow-apple-sm transition"
-                />
-              </div>
-
-              <p className="text-[11px] text-zinc-500">
-                When provided, llama-benchy extracts slices of this text for prompt prefill and context generation instead of downloading online books.
-              </p>
-            </div>
-          </GlassCard>
+          {/* NOTE: llama-benchy has no --dataset-file flag; removed the custom
+              dataset card that used to emit it (argparse would reject it). */}
         </div>
       )}
 
@@ -484,18 +458,11 @@ export const ConfigPanel: React.FC<ConfigPanelProps> = ({ config, onChange }) =>
               </div>
 
               <div className="border-t border-black/5 dark:border-white/5 pt-3">
-                <Stepper
-                  label="Sample Interval"
-                  sublabel="Sampling frequency for throughput calculations"
-                  flagName="--sample-interval"
-                  value={config.sampleInterval}
-                  min={0.1}
-                  max={5.0}
-                  step={0.5}
-                  unit="s"
-                  onChange={(val) => updateConfig('sampleInterval', val)}
-                  quickOptions={[0.5, 1.0, 2.0]}
-                />
+                {/* NOTE: --sample-interval does not exist in llama-benchy; the
+                    sampling window is fixed at 1 second upstream. */}
+                <p className="text-[11px] text-zinc-500">
+                  Throughput is sampled in 1-second windows upstream (fixed by llama-benchy).
+                </p>
               </div>
             </div>
           </GlassCard>
@@ -573,12 +540,11 @@ export const ConfigPanel: React.FC<ConfigPanelProps> = ({ config, onChange }) =>
               </div>
 
               <div className="border-t border-black/5 dark:border-white/5 pt-3">
-                <Switch
-                  checked={config.verbose}
-                  onChange={(checked) => updateConfig('verbose', checked)}
-                  label="Verbose Logging (--verbose)"
-                  description="Output detailed HTTP debug info and request roundtrip traces"
-                />
+                {/* NOTE: llama-benchy has no --verbose flag; removed the switch
+                    that used to emit it. */}
+                <p className="text-[11px] text-zinc-500">
+                  HTTP request traces are printed upstream when --emit-progress is active.
+                </p>
               </div>
             </div>
           </GlassCard>

@@ -2,6 +2,7 @@ import { NextRequest } from 'next/server';
 import { spawn } from 'child_process';
 import { BenchmarkConfig } from '@/types/benchmark';
 import { buildCliArgs } from '@/utils/commandBuilder';
+import { benchyTestName, buildTotalThroughputTimeseries } from '@/utils/formatters';
 
 export const dynamic = 'force-dynamic';
 
@@ -31,7 +32,13 @@ export async function POST(req: NextRequest) {
           event: 'start',
           timestamp: new Date().toISOString(),
           message: `Starting llama-benchy benchmark for ${config.model || 'auto-detected model'} on ${config.baseUrl}...`,
-          totalTests: (config.pp.length + config.tg.length) * config.depth.length * config.concurrency.length,
+          // llama-benchy runs the cartesian matrix pp × tg × depth × concurrency
+          // (each cell generates pp prompt tokens and tg output tokens together).
+          totalTests:
+            (config.pp.length || 1) *
+            (config.tg.length || 1) *
+            (config.depth.length || 1) *
+            (config.concurrency.length || 1),
         });
 
         // Determine if llama-benchy is installed directly or use uvx
@@ -50,22 +57,40 @@ export async function POST(req: NextRequest) {
         let fullStdout = '';
         let fullStderr = '';
 
-        const totalShapes = (config.pp.length + config.tg.length) * config.depth.length * config.concurrency.length;
+        const totalShapes =
+          (config.pp.length || 1) *
+          (config.tg.length || 1) *
+          (config.depth.length || 1) *
+          (config.concurrency.length || 1);
         const totalRunsPerShape = config.runs || 3;
         const totalRequests = Math.max(1, totalShapes * totalRunsPerShape);
         let completedRequests = 0;
         let lastTtfrMs: number | undefined = undefined;
+        let lastE2eTtftMs: number | undefined = undefined;
+        let measuredLatencyMs: number | undefined = undefined;
         let currentPromptSize = config.pp[0] || 2048;
         let currentResponseSize = config.tg[0] || 32;
         let currentDepth = config.depth[0] || 0;
         let currentConcurrency = config.concurrency[0] || 1;
         let currentRunIndex = 0;
 
+        // llama-benchy emits newline-delimited JSON; a line can be split across
+        // chunks, so keep a partial-line buffer instead of parsing per chunk.
+        let stdoutLineBuffer = '';
+        let stderrLineBuffer = '';
+
+        // Collect token-chunk timestamps from the progress stream to build the
+        // total-throughput timeseries (same source data upstream uses for its
+        // peak-throughput calculation).
+        const tokenEvents: { ts: number; count: number }[] = [];
+
         proc.stdout.on('data', (chunk: Buffer) => {
           const text = chunk.toString();
           fullStdout += text;
+          stdoutLineBuffer += text;
 
-          const lines = text.split('\n');
+          const lines = stdoutLineBuffer.split('\n');
+          stdoutLineBuffer = lines.pop() || '';
           for (const line of lines) {
             const trimmed = line.trim();
             if (!trimmed) continue;
@@ -83,9 +108,7 @@ export async function POST(req: NextRequest) {
                   currentConcurrency = parsed.concurrency ?? currentConcurrency;
                   currentRunIndex = parsed.run_index ?? currentRunIndex;
 
-                  const testShapeName = currentDepth > 0
-                    ? `pp${currentPromptSize} / tg${currentResponseSize} @ d${currentDepth}${currentConcurrency > 1 ? ` c${currentConcurrency}` : ''}`
-                    : `pp${currentPromptSize} / tg${currentResponseSize}${currentConcurrency > 1 ? ` c${currentConcurrency}` : ''}`;
+                  const testShapeName = benchyTestName('pp', currentPromptSize, currentDepth, currentConcurrency);
 
                   displayMsg = `[Start] pp=${currentPromptSize} tg=${currentResponseSize} depth=${currentDepth} c=${currentConcurrency} (Run #${currentRunIndex + 1}/${totalRunsPerShape})`;
 
@@ -117,49 +140,82 @@ export async function POST(req: NextRequest) {
                   });
                   continue;
                 } else if (parsed.type === 'request_first_token') {
-                  displayMsg = `[TTFT] First token in ${(parsed.ttft_s * 1000).toFixed(1)} ms`;
+                  // e2e_ttft: end-to-end time to first content token (seconds)
+                  lastE2eTtftMs = parsed.ttft_s * 1000;
+                  displayMsg = `[TTFT] First token in ${lastE2eTtftMs.toFixed(1)} ms`;
                 } else if (parsed.type === 'tokens') {
+                  if (typeof parsed.ts === 'number') {
+                    tokenEvents.push({ ts: parsed.ts, count: parsed.count || 1 });
+                  }
                   displayMsg = `[Token] "${parsed.snippet?.replace(/\n/g, '\\n')}"`;
                 } else if (parsed.type === 'request_end') {
                   completedRequests++;
                   const decodeSec = parsed.decode_seconds || 0.001;
-                  const tps = parsed.total_tokens > 0 ? parsed.total_tokens / decodeSec : 0;
+                  const totalTokens = parsed.total_tokens || 0;
+                  const tgTps = totalTokens > 0 ? totalTokens / decodeSec : 0;
                   const progress = Math.min(99, Math.max(5, Math.round((completedRequests / totalRequests) * 100)));
 
-                  displayMsg = `[End] ${parsed.total_tokens} tokens decoded in ${decodeSec.toFixed(2)}s (${tps.toFixed(1)} t/s)`;
+                  displayMsg = `[End] ${totalTokens} tokens decoded in ${decodeSec.toFixed(2)}s (${tgTps.toFixed(1)} t/s)`;
 
-                  const testShapeName = currentDepth > 0
-                    ? `pp${currentPromptSize} @ d${currentDepth}${currentConcurrency > 1 ? ` c${currentConcurrency}` : ''}`
-                    : `pp${currentPromptSize}${currentConcurrency > 1 ? ` c${currentConcurrency}` : ''}`;
+                  // Mirror upstream metric semantics: est_ppt = ttfr − network latency,
+                  // pp speed = prompt tokens / est_ppt. No fabricated peak values.
+                  const estPptMs = lastTtfrMs !== undefined
+                    ? Math.max(0, lastTtfrMs - (measuredLatencyMs ?? 0))
+                    : undefined;
+                  const promptTokens = parsed.prompt_tokens || currentPromptSize + currentDepth;
 
-                  const liveRow = {
-                    id: `live-${completedRequests}`,
-                    model: config.model || 'phibek-4b-v0.1',
-                    test: testShapeName,
+                  const ppLiveRow = {
+                    id: `live-pp-${completedRequests}`,
+                    model: config.model || 'unknown',
+                    test: benchyTestName('pp', currentPromptSize, currentDepth, currentConcurrency),
                     pp: currentPromptSize,
+                    tg: 0,
+                    depth: currentDepth,
+                    concurrency: currentConcurrency,
+                    tps: estPptMs && estPptMs > 0 ? promptTokens / (estPptMs / 1000) : 0,
+                    ttfrMs: lastTtfrMs,
+                    estPptMs,
+                    e2eTtftMs: lastE2eTtftMs,
+                  };
+
+                  const tgLiveRow = {
+                    id: `live-tg-${completedRequests}`,
+                    model: config.model || 'unknown',
+                    test: benchyTestName('tg', currentResponseSize, currentDepth, currentConcurrency),
+                    pp: 0,
                     tg: currentResponseSize,
                     depth: currentDepth,
                     concurrency: currentConcurrency,
-                    tps: tps,
-                    peakTps: tps * 1.05,
+                    tps: tgTps,
                     ttfrMs: lastTtfrMs,
-                    estPptMs: lastTtfrMs,
-                    e2eTtftMs: lastTtfrMs,
                   };
 
                   sendEvent({
                     event: 'live_metric',
                     timestamp: new Date().toISOString(),
-                    currentTest: testShapeName,
-                    currentTps: tps,
+                    currentTest: ppLiveRow.test,
                     progressPercent: progress,
-                    liveRow,
+                    liveRow: ppLiveRow,
+                    data: parsed,
+                    message: `[Prefill] ${ppLiveRow.test} -> ${ppLiveRow.tps > 0 ? `${ppLiveRow.tps.toFixed(1)} t/s` : 'n/a'}`,
+                  });
+
+                  sendEvent({
+                    event: 'live_metric',
+                    timestamp: new Date().toISOString(),
+                    currentTest: tgLiveRow.test,
+                    currentTps: tgTps,
+                    progressPercent: progress,
+                    liveRow: tgLiveRow,
                     data: parsed,
                     message: displayMsg,
                   });
                   continue;
                 } else if (parsed.type === 'latency_measured') {
-                  displayMsg = `[Latency] ${parsed.mode} latency: ${(parsed.latency_s * 1000).toFixed(2)} ms`;
+                  // Upstream emits this once before all requests; consumers are
+                  // expected to compute est_ppt = ttfr − latency.
+                  measuredLatencyMs = parsed.latency_s * 1000;
+                  displayMsg = `[Latency] ${parsed.mode} latency: ${measuredLatencyMs.toFixed(2)} ms`;
                 } else if (parsed.type === 'bench_complete') {
                   displayMsg = `[Complete] Benchmark matrix completed (Status: ${parsed.status})`;
                 } else {
@@ -190,8 +246,10 @@ export async function POST(req: NextRequest) {
         proc.stderr.on('data', (chunk: Buffer) => {
           const text = chunk.toString();
           fullStderr += text;
+          stderrLineBuffer += text;
 
-          const lines = text.split('\n');
+          const lines = stderrLineBuffer.split('\n');
+          stderrLineBuffer = lines.pop() || '';
           for (const line of lines) {
             const trimmed = line.trim();
             if (!trimmed) continue;
@@ -204,6 +262,16 @@ export async function POST(req: NextRequest) {
         });
 
         proc.on('close', (code) => {
+          // Flush any remaining partial lines (EOF without trailing newline)
+          if (stdoutLineBuffer.trim()) {
+            fullStdout += stdoutLineBuffer;
+            stdoutLineBuffer = '';
+          }
+          if (stderrLineBuffer.trim()) {
+            fullStderr += stderrLineBuffer;
+            stderrLineBuffer = '';
+          }
+
           const combinedOutput = `${fullStdout}\n${fullStderr}`;
           const isNoResults = combinedOutput.includes('No results collected') || combinedOutput.includes('Check if the model is generating tokens');
 
@@ -213,6 +281,9 @@ export async function POST(req: NextRequest) {
               timestamp: new Date().toISOString(),
               message: 'Benchmark completed successfully.',
               fullStdout: combinedOutput,
+              // Real-run timeseries derived from the progress stream
+              // (1-second total-throughput bins across all requests).
+              timeseries: buildTotalThroughputTimeseries(tokenEvents),
             });
           } else if (isNoResults) {
             sendEvent({
@@ -271,7 +342,7 @@ async function runSimulatedBenchmark(
   const runs = config.runs || 3;
   const concs = config.concurrency.length > 0 ? config.concurrency : [1];
 
-  const totalShapes = depths.length * (pps.length + tgs.length) * concs.length;
+  const totalShapes = depths.length * pps.length * tgs.length * concs.length;
 
   sendEvent({
     event: 'start',
@@ -316,152 +387,117 @@ async function runSimulatedBenchmark(
 
   for (const conc of concs) {
     for (const depth of depths) {
-      // Prompt processing test
+      // llama-benchy runs a cartesian matrix: every (pp, tg) pair is ONE cell.
+      // Each cell issues num_runs requests that send pp prompt tokens and
+      // generate tg output tokens together, then reports both a pp row and a
+      // tg row from the same measurements.
       for (const pp of pps) {
-        testCount++;
-        const testName = depth > 0 ? `pp${pp} @ d${depth}${conc > 1 ? ` c${conc}` : ''}` : `pp${pp}${conc > 1 ? ` c${conc}` : ''}`;
-        const progress = Math.round((testCount / totalShapes) * 90) + 8;
+        for (const tg of tgs) {
+          testCount++;
+          const testName = benchyTestName('pp', pp, depth, conc);
+          const tgTestName = benchyTestName('tg', tg, depth, conc);
+          const progress = Math.round((testCount / totalShapes) * 90) + 8;
 
-        sendEvent({
-          event: 'run_start',
-          timestamp: new Date().toISOString(),
-          testIndex: testCount,
-          totalTests: totalShapes,
-          currentTest: testName,
-          pp,
-          tg: 0,
-          depth,
-          concurrency: conc,
-          message: `Benchmarking Prompt Processing: ${testName} (${runs} runs)...`,
-          progressPercent: progress,
-        });
-
-        // Simulating runs
-        const depthPenalty = 1 - (depth / 131072) * 0.28;
-        const concMultiplier = Math.pow(conc, 0.72);
-        const calcPpSpeed = (basePpSpeed * depthPenalty * concMultiplier * (1 + (Math.random() * 0.04 - 0.02)));
-        const calcEstPpt = ((pp / calcPpSpeed) * 1000) * (1 + (Math.random() * 0.02));
-        const calcTtfr = (baseTtfr + (depth * 0.14) + (pp * 0.08)) * (1 + (Math.random() * 0.03));
-        const calcE2e = calcTtfr + 42 + Math.random() * 10;
-
-        for (let r = 1; r <= runs; r++) {
-          await sleep(400);
           sendEvent({
-            event: 'run_progress',
+            event: 'run_start',
             timestamp: new Date().toISOString(),
             testIndex: testCount,
-            runIndex: r,
-            totalRuns: runs,
+            totalTests: totalShapes,
             currentTest: testName,
-            currentTps: calcPpSpeed,
-            progressPercent: progress,
-            message: `Run ${r}/${runs}: ${calcPpSpeed.toFixed(1)} t/s, TTFR: ${calcTtfr.toFixed(1)} ms`,
-          });
-        }
-
-        const ppStd = Math.max(8.5, calcPpSpeed * 0.008);
-        const ttfrStd = Math.max(1.5, calcTtfr * 0.006);
-
-        const row = {
-          id: `row-${testCount}`,
-          model: modelName,
-          test: testName,
-          pp,
-          tg: 0,
-          depth,
-          concurrency: conc,
-          tps: calcPpSpeed,
-          tpsStd: ppStd,
-          peakTps: undefined,
-          ttfrMs: calcTtfr,
-          ttfrStd: ttfrStd,
-          estPptMs: calcEstPpt,
-          estPptStd: ttfrStd,
-          e2eTtftMs: calcE2e,
-          e2eTtftStd: ttfrStd * 1.5,
-        };
-        resultRows.push(row);
-
-        sendEvent({
-          event: 'run_complete',
-          timestamp: new Date().toISOString(),
-          data: row,
-          message: `Completed ${testName} -> ${calcPpSpeed.toFixed(1)} ± ${ppStd.toFixed(1)} t/s`,
-        });
-      }
-
-      // Token generation test
-      for (const tg of tgs) {
-        testCount++;
-        const testName = depth > 0 ? `tg${tg} @ d${depth}${conc > 1 ? ` c${conc}` : ''}` : `tg${tg}${conc > 1 ? ` c${conc}` : ''}`;
-        const progress = Math.round((testCount / totalShapes) * 90) + 8;
-
-        sendEvent({
-          event: 'run_start',
-          timestamp: new Date().toISOString(),
-          testIndex: testCount,
-          totalTests: totalShapes,
-          currentTest: testName,
-          pp: 0,
-          tg,
-          depth,
-          concurrency: conc,
-          message: `Benchmarking Token Generation: ${testName} (${runs} runs)...`,
-          progressPercent: progress,
-        });
-
-        const depthPenalty = 1 - (depth / 65536) * 0.12;
-        const concTgTotal = (baseTgSpeed * Math.pow(conc, 0.88) * depthPenalty);
-        const singleReqTps = concTgTotal / conc;
-        const peakTps = concTgTotal * 1.04;
-
-        for (let r = 1; r <= runs; r++) {
-          await sleep(450);
-          currentTimeSec += 1;
-          timeseries.push({
-            time: currentTimeSec,
-            totalThroughput: concTgTotal * (1 + (Math.random() * 0.05 - 0.025)),
+            pp,
+            tg,
             depth,
             concurrency: conc,
+            message: `Benchmarking ${testName} + ${tgTestName} (${runs} runs)...`,
+            progressPercent: progress,
+          });
+
+          const depthPenalty = 1 - (depth / 131072) * 0.28;
+          const concMultiplier = Math.pow(conc, 0.72);
+          const calcPpSpeed = (basePpSpeed * depthPenalty * concMultiplier * (1 + (Math.random() * 0.04 - 0.02)));
+          const calcEstPpt = ((pp / calcPpSpeed) * 1000) * (1 + (Math.random() * 0.02));
+          const calcTtfr = (baseTtfr + (depth * 0.14) + (pp * 0.08)) * (1 + (Math.random() * 0.03));
+          const calcE2e = calcTtfr + 42 + Math.random() * 10;
+
+          const tgDepthPenalty = 1 - (depth / 65536) * 0.12;
+          const concTgTotal = (baseTgSpeed * Math.pow(conc, 0.88) * tgDepthPenalty);
+
+          for (let r = 1; r <= runs; r++) {
+            await sleep(450);
+            currentTimeSec += 1;
+            timeseries.push({
+              time: currentTimeSec,
+              totalThroughput: concTgTotal * (1 + (Math.random() * 0.05 - 0.025)),
+              depth,
+              concurrency: conc,
+            });
+
+            sendEvent({
+              event: 'run_progress',
+              timestamp: new Date().toISOString(),
+              testIndex: testCount,
+              runIndex: r,
+              totalRuns: runs,
+              currentTest: testName,
+              currentTps: calcPpSpeed,
+              progressPercent: progress,
+              message: `Run ${r}/${runs}: pp ${calcPpSpeed.toFixed(1)} t/s, tg ${concTgTotal.toFixed(2)} t/s, TTFR ${calcTtfr.toFixed(1)} ms`,
+            });
+          }
+
+          const ppStd = Math.max(8.5, calcPpSpeed * 0.008);
+          const ttfrStd = Math.max(1.5, calcTtfr * 0.006);
+          const tgStd = Math.max(0.4, concTgTotal * 0.01);
+          const peakStd = tgStd * 1.1;
+          const peakTps = concTgTotal * 1.04;
+
+          const ppRow = {
+            id: `row-pp-${testCount}`,
+            model: modelName,
+            test: testName,
+            pp,
+            tg: 0,
+            depth,
+            concurrency: conc,
+            tps: calcPpSpeed,
+            tpsStd: ppStd,
+            ttfrMs: calcTtfr,
+            ttfrStd: ttfrStd,
+            estPptMs: calcEstPpt,
+            estPptStd: ttfrStd,
+            e2eTtftMs: calcE2e,
+            e2eTtftStd: ttfrStd * 1.5,
+          };
+
+          const tgRow = {
+            id: `row-tg-${testCount}`,
+            model: modelName,
+            test: tgTestName,
+            pp: 0,
+            tg,
+            depth,
+            concurrency: conc,
+            tps: concTgTotal,
+            tpsStd: tgStd,
+            peakTps: peakTps,
+            peakTpsStd: peakStd,
+          };
+          resultRows.push(ppRow, tgRow);
+
+          sendEvent({
+            event: 'run_complete',
+            timestamp: new Date().toISOString(),
+            data: ppRow,
+            message: `Completed ${testName} -> ${calcPpSpeed.toFixed(1)} ± ${ppStd.toFixed(1)} t/s`,
           });
 
           sendEvent({
-            event: 'run_progress',
+            event: 'run_complete',
             timestamp: new Date().toISOString(),
-            testIndex: testCount,
-            runIndex: r,
-            totalRuns: runs,
-            currentTest: testName,
-            currentTps: concTgTotal,
-            progressPercent: progress,
-            message: `Run ${r}/${runs}: ${concTgTotal.toFixed(2)} t/s (Peak: ${peakTps.toFixed(2)} t/s)`,
+            data: tgRow,
+            message: `Completed ${tgTestName} -> ${concTgTotal.toFixed(2)} ± ${tgStd.toFixed(2)} t/s`,
           });
         }
-
-        const tgStd = Math.max(0.4, concTgTotal * 0.01);
-        const peakStd = tgStd * 1.1;
-
-        const row = {
-          id: `row-${testCount}`,
-          model: modelName,
-          test: testName,
-          pp: 0,
-          tg,
-          depth,
-          concurrency: conc,
-          tps: concTgTotal,
-          tpsStd: tgStd,
-          peakTps: peakTps,
-          peakTpsStd: peakStd,
-        };
-        resultRows.push(row);
-
-        sendEvent({
-          event: 'run_complete',
-          timestamp: new Date().toISOString(),
-          data: row,
-          message: `Completed ${testName} -> ${concTgTotal.toFixed(2)} ± ${tgStd.toFixed(2)} t/s`,
-        });
       }
     }
   }
@@ -494,7 +530,7 @@ function generateMarkdownTable(model: string, rows: any[], latencyMode: string) 
     output += `| ${model} | ${r.test} | ${tpsStr} | ${peakStr} | ${ttfrStr} | ${estPptStr} | ${e2eStr} |\n`;
   }
 
-  output += `\nllama-benchy (0.2.2)\ndate: ${new Date().toISOString().replace('T', ' ').substring(0, 19)} | latency mode: ${latencyMode}\n`;
+  output += `\nllama-benchy\ndate: ${new Date().toISOString().replace('T', ' ').substring(0, 19)} | latency mode: ${latencyMode}\n`;
   return output;
 }
 

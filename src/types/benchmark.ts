@@ -69,6 +69,11 @@ export interface ProgressEvent {
   progressPercent?: number;
   liveRow?: BenchmarkResultRow;
   data?: any;
+  // 'complete' event extras
+  fullStdout?: string;
+  fullStderr?: string;
+  rows?: BenchmarkResultRow[];
+  timeseries?: ThroughputDataPoint[];
 }
 
 export interface BenchmarkResultRow {
@@ -81,14 +86,19 @@ export interface BenchmarkResultRow {
   concurrency: number;
   tps: number;
   tpsStd?: number;
+  tpsReq?: number;
+  tpsReqStd?: number;
   peakTps?: number;
   peakTpsStd?: number;
+  peakReqTps?: number;
+  peakReqTpsStd?: number;
   ttfrMs?: number;
   ttfrStd?: number;
   estPptMs?: number;
   estPptStd?: number;
   e2eTtftMs?: number;
   e2eTtftStd?: number;
+  isContextPhase?: boolean;
   rawText?: string;
 }
 

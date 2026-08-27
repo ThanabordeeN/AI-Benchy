@@ -1,5 +1,55 @@
 import { BenchmarkResultRow } from '@/types/benchmark';
 
+/**
+ * Builds test names that match llama-benchy's real results table:
+ *   pp512 @ d4096 (c4)   tg128 @ d4096 (c4)
+ *   ctx_pp @ d4096 (c4)  ctx_tg @ d4096 (c4)
+ * The depth suffix only appears when depth > 0 and the concurrency suffix
+ * only appears when concurrency > 1 (mirrors src/llama_benchy/results.py).
+ */
+export function benchyTestName(
+  kind: 'pp' | 'tg' | 'ctx_pp' | 'ctx_tg',
+  size: number,
+  depth: number,
+  concurrency: number
+): string {
+  const cSuffix = concurrency > 1 ? ` (c${concurrency})` : '';
+  if (kind === 'ctx_pp' || kind === 'ctx_tg') {
+    return `${kind} @ d${depth}${cSuffix}`;
+  }
+  const dSuffix = depth > 0 ? ` @ d${depth}` : '';
+  return `${kind}${size}${dSuffix}${cSuffix}`;
+}
+
+/**
+ * Builds a total-throughput timeseries (1-second bins) from llama-benchy
+ * progress-stream `tokens` events ({ ts, count }). This mirrors what upstream
+ * computes internally for peak throughput (sliding 1s window over token
+ * timestamps), so real runs get the same timeseries data the simulated demo
+ * produces — without depending on the JSON report file.
+ * `time` is 1-based seconds since the first token chunk.
+ */
+export function buildTotalThroughputTimeseries(
+  tokenEvents: { ts: number; count: number }[]
+): { time: number; totalThroughput: number }[] {
+  if (tokenEvents.length === 0) return [];
+
+  const sorted = tokenEvents.filter((e) => typeof e.ts === 'number' && isFinite(e.ts));
+  if (sorted.length === 0) return [];
+  sorted.sort((a, b) => a.ts - b.ts);
+
+  const t0 = sorted[0].ts;
+  const bins = new Map<number, number>();
+  for (const e of sorted) {
+    const sec = Math.max(0, Math.floor(e.ts - t0));
+    bins.set(sec, (bins.get(sec) || 0) + (e.count || 1));
+  }
+
+  return Array.from(bins.entries())
+    .sort((a, b) => a[0] - b[0])
+    .map(([sec, count]) => ({ time: sec + 1, totalThroughput: count }));
+}
+
 export function formatTps(val?: number, std?: number): string {
   if (val === undefined || isNaN(val)) return '—';
   const valStr = val >= 1000 ? val.toFixed(1) : val.toFixed(2);
@@ -66,8 +116,11 @@ export function parseLlamaBenchMarkdown(md: string): BenchmarkResultRow[] {
 
     const model = rowObj['model'] || 'Unknown Model';
     const test = rowObj['test'] || '';
-    const tpsRaw = rowObj['t/s'] || rowObj['tps'] || '';
+    // c=1 tables use "t/s"; c>1 tables use "t/s (total)" + per-request columns.
+    const tpsRaw = rowObj['t/s'] || rowObj['t/s (total)'] || rowObj['tps'] || '';
+    const tpsReqRaw = rowObj['t/s (req)'] || '';
     const peakTpsRaw = rowObj['peak t/s'] || '';
+    const peakTpsReqRaw = rowObj['peak t/s (req)'] || '';
     const ttfrRaw = rowObj['ttfr (ms)'] || '';
     const estPptRaw = rowObj['est_ppt (ms)'] || '';
     const e2eTtftRaw = rowObj['e2e_ttft (ms)'] || '';
@@ -82,22 +135,30 @@ export function parseLlamaBenchMarkdown(md: string): BenchmarkResultRow[] {
     };
 
     const tpsParsed = parseValueStd(tpsRaw);
+    const tpsReqParsed = parseValueStd(tpsReqRaw);
     const peakTpsParsed = parseValueStd(peakTpsRaw);
+    const peakTpsReqParsed = parseValueStd(peakTpsReqRaw);
     const ttfrParsed = parseValueStd(ttfrRaw);
     const estPptParsed = parseValueStd(estPptRaw);
     const e2eTtftParsed = parseValueStd(e2eTtftRaw);
 
-    // Extract pp, tg, depth from test string (e.g. "pp2048 @ d4096", "tg32 @ d8192 c4")
+    // Extract pp, tg, depth, concurrency from the test string.
+    // Real names: "pp512 @ d4096 (c4)", "tg128", "ctx_pp @ d8192 (c2)".
+    // ctx_* rows come from the --enable-prefix-caching context-load phase and
+    // have no numeric pp/tg size embedded in the name.
     let pp = 0;
     let tg = 0;
     let depth = 0;
     let concurrency = 1;
+    const isContextPhase = /^ctx_(pp|tg)/i.test(test);
 
-    const ppMatch = test.match(/pp(\d+)/i);
-    if (ppMatch) pp = parseInt(ppMatch[1], 10);
+    if (!isContextPhase) {
+      const ppMatch = test.match(/pp(\d+)/i);
+      if (ppMatch) pp = parseInt(ppMatch[1], 10);
 
-    const tgMatch = test.match(/tg(\d+)/i);
-    if (tgMatch) tg = parseInt(tgMatch[1], 10);
+      const tgMatch = test.match(/tg(\d+)/i);
+      if (tgMatch) tg = parseInt(tgMatch[1], 10);
+    }
 
     const depthMatch = test.match(/d(\d+)/i);
     if (depthMatch) depth = parseInt(depthMatch[1], 10);
@@ -115,14 +176,19 @@ export function parseLlamaBenchMarkdown(md: string): BenchmarkResultRow[] {
       concurrency,
       tps: tpsParsed.val || 0,
       tpsStd: tpsParsed.std,
+      tpsReq: tpsReqParsed.val,
+      tpsReqStd: tpsReqParsed.std,
       peakTps: peakTpsParsed.val,
       peakTpsStd: peakTpsParsed.std,
+      peakReqTps: peakTpsReqParsed.val,
+      peakReqTpsStd: peakTpsReqParsed.std,
       ttfrMs: ttfrParsed.val,
       ttfrStd: ttfrParsed.std,
       estPptMs: estPptParsed.val,
       estPptStd: estPptParsed.std,
       e2eTtftMs: e2eTtftParsed.val,
       e2eTtftStd: e2eTtftParsed.std,
+      isContextPhase,
       rawText: trimmed,
     });
   }

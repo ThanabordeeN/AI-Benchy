@@ -1,41 +1,8 @@
 import { NextRequest } from 'next/server';
 import { EvalScopeConfig, HeatmapCell } from '@/types/evalscope';
-import { computeContextLengths, computeDepthPercents } from '@/utils/evalscope';
+import { computeContextLengths, computeDepthPercents, generateHaystackWithNeedle, scoreNeedleResponse } from '@/utils/evalscope';
 
 export const dynamic = 'force-dynamic';
-
-const FILLER_SENTENCE =
-  'The quick brown fox jumps over the lazy dog and explores the distributed architecture of high performance neural inference runtimes. ';
-
-function generateHaystackWithNeedle(
-  targetTokens: number,
-  depthPercent: number,
-  needle: string
-): string {
-  // Approximate ~4 chars per token for English text
-  const totalChars = targetTokens * 4;
-  const sentenceChars = FILLER_SENTENCE.length;
-  const totalSentences = Math.max(1, Math.floor(totalChars / sentenceChars));
-  const insertIndex = Math.min(
-    totalSentences - 1,
-    Math.floor(totalSentences * (depthPercent / 100))
-  );
-
-  const parts: string[] = [];
-  for (let i = 0; i < totalSentences; i++) {
-    if (i === insertIndex) {
-      parts.push(`\n\nImportant Fact: ${needle}\n\n`);
-    }
-    parts.push(FILLER_SENTENCE);
-  }
-
-  // If needle wasn't inserted (e.g. depth 100%)
-  if (insertIndex >= totalSentences - 1 && !parts.some((p) => p.includes(needle))) {
-    parts.push(`\n\nImportant Fact: ${needle}\n\n`);
-  }
-
-  return parts.join(' ');
-}
 
 export async function POST(req: NextRequest) {
   try {
@@ -140,47 +107,20 @@ export async function POST(req: NextRequest) {
                   '';
                 responseSnippet = text.trim();
 
-                // Extract needle keyword or key code
-                const needleKeywords = targetNeedle
-                  .replace(/[.,\/#!$%\^&\*;:{}=\-_`~()]/g, '')
-                  .split(/\s+/)
-                  .filter((w) => w.length > 3);
-
-                const foundCount = needleKeywords.filter((k) =>
-                  text.toLowerCase().includes(k.toLowerCase())
-                ).length;
-
-                if (foundCount === needleKeywords.length || text.includes('ZX-48291')) {
-                  score = 1.0;
-                  status = 'passed';
-                } else if (foundCount > 0) {
-                  score = 0.6;
-                  status = 'partial';
-                } else {
-                  score = 0.0;
-                  status = 'failed';
-                }
+                // Score against the user-configured needle (shared helper)
+                const verdict = scoreNeedleResponse(text, targetNeedle);
+                score = verdict.score;
+                status = verdict.status;
               } else {
                 throw new Error(`HTTP ${res.status}`);
               }
             } catch (err: any) {
-              // Fallback / simulation if endpoint fails or unavailable
-              latencyMs = Date.now() - startTime + Math.round(Math.random() * 150) + 300;
-              responseSnippet = `The secret verification code is ${targetNeedle.split('is ')[1] || 'ZX-48291.'}`;
-
-              if (ctx > 128000) {
-                const failureChance = (ctx - 128000) / 100000;
-                const rand = Math.random();
-                if (rand < failureChance * 0.45) {
-                  score = 0.0;
-                  status = 'failed';
-                  responseSnippet = 'I could not locate the verification code in the document.';
-                } else if (rand < failureChance * 0.75) {
-                  score = 0.6;
-                  status = 'partial';
-                  responseSnippet = 'The code is partially mentioned as ZX-...';
-                }
-              }
+              // Do NOT fabricate results when the endpoint fails: report the
+              // cell as failed with the underlying error so the heatmap stays
+              // honest (previously this path simulated scores silently).
+              score = 0.0;
+              status = 'failed';
+              responseSnippet = `Error: ${err?.message || 'Request failed'}`;
             }
 
             const cellResult: HeatmapCell = {

@@ -17,7 +17,7 @@ import { NeedleHeatmap } from '@/components/evalscope/NeedleHeatmap';
 import { NeedleCodePreview } from '@/components/evalscope/NeedleCodePreview';
 import { NeedleReportModal } from '@/components/evalscope/NeedleReportModal';
 import { DEFAULT_CONFIG, PRESET_TEMPLATES } from '@/utils/presets';
-import { DEFAULT_EVALSCOPE_CONFIG, computeContextLengths, computeDepthPercents } from '@/utils/evalscope';
+import { DEFAULT_EVALSCOPE_CONFIG, computeContextLengths, computeDepthPercents, generateHaystackWithNeedle, scoreNeedleResponse } from '@/utils/evalscope';
 import { parseLlamaBenchMarkdown } from '@/utils/formatters';
 import { generateStructuredMarkdownReport } from '@/utils/reportGenerator';
 import { initNeutralino, isNeutralino, runNeutralinoBenchmark } from '@/utils/neutralino';
@@ -166,40 +166,33 @@ export default function Home() {
       setResultRows([...accumulatedRows]);
     }
 
-    if (data.event === 'stdout' && data.message?.includes('|') && !data.message.includes('---')) {
-      const parsedRows = parseLlamaBenchMarkdown(data.message);
-      if (parsedRows.length > 0) {
-        for (const row of parsedRows) {
-          const idx = accumulatedRows.findIndex((r) => r.test === row.test);
-          if (idx >= 0) {
-            accumulatedRows[idx] = row;
-          } else {
-            accumulatedRows.push(row);
-          }
-          setLatestRow(row);
-        }
-        setResultRows([...accumulatedRows]);
-      }
-    }
+    // NOTE: per-line markdown parsing was removed — llama-benchy prints the
+    // results table at the end of the run, so it is parsed once from the
+    // 'complete' event below (a single table row alone cannot be parsed).
 
     if (data.event === 'complete') {
-      if (data.data?.rows && data.data.rows.length > 0) {
-        setResultRows(data.data.rows);
-        setLatestRow(data.data.rows[data.data.rows.length - 1]);
+      if (data.rows && data.rows.length > 0) {
+        setResultRows(data.rows);
+        setLatestRow(data.rows[data.rows.length - 1]);
       }
-      if (data.data?.timeseries) {
-        setTimeseries(data.data.timeseries);
+      const finalTimeseries = data.timeseries || data.data?.timeseries;
+      if (finalTimeseries && finalTimeseries.length > 0) {
+        accumulatedTimeseries.length = 0;
+        accumulatedTimeseries.push(...finalTimeseries);
+        setTimeseries([...accumulatedTimeseries]);
       }
-      if ((data as any).fullStdout) {
-        finalMarkdownRef.current = (data as any).fullStdout;
+      if (data.fullStdout) {
+        finalMarkdownRef.current = data.fullStdout;
         setRawMarkdown(finalMarkdownRef.current);
-        if (accumulatedRows.length === 0) {
-          const parsed = parseLlamaBenchMarkdown(finalMarkdownRef.current);
-          if (parsed.length > 0) {
-            accumulatedRows.push(...parsed);
-            setResultRows([...accumulatedRows]);
-            setLatestRow(parsed[parsed.length - 1]);
-          }
+        // The final llama-benchy results table (mean ± std) is authoritative:
+        // replace the approximate live rows with the parsed real rows whenever
+        // the table is present in the output.
+        const parsed = parseLlamaBenchMarkdown(finalMarkdownRef.current);
+        if (parsed.length > 0) {
+          accumulatedRows.length = 0;
+          accumulatedRows.push(...parsed);
+          setResultRows([...accumulatedRows]);
+          setLatestRow(parsed[parsed.length - 1]);
         }
       }
       setProgressPercent(100);
@@ -378,16 +371,9 @@ export default function Home() {
           let latencyMs = 0;
 
           try {
-            // Construct Prompt
-            const filler = 'The quick brown fox jumps over the lazy dog and explores the dense algorithmic architecture of neural language models. ';
-            const totalSentences = Math.max(1, Math.floor((ctx * 4) / filler.length));
-            const insertIdx = Math.min(totalSentences - 1, Math.floor(totalSentences * (depth / 100)));
-            const parts: string[] = [];
-            for (let i = 0; i < totalSentences; i++) {
-              if (i === insertIdx) parts.push(`\n\nImportant Fact: ${targetNeedle}\n\n`);
-              parts.push(filler);
-            }
-            const prompt = `${parts.join(' ')}\n\nQuestion: ${evalScopeConfig.datasetArgs.retrievalQuestion}\nAnswer directly and concisely:`;
+            // Construct Prompt (shared haystack generator, same as server route)
+            const haystack = generateHaystackWithNeedle(ctx, depth, targetNeedle);
+            const prompt = `${haystack}\n\nQuestion: ${evalScopeConfig.datasetArgs.retrievalQuestion}\nAnswer directly and concisely:`;
 
             const headers: Record<string, string> = { 'Content-Type': 'application/json' };
             if (evalScopeConfig.apiKey && evalScopeConfig.apiKey !== 'EMPTY') {
@@ -417,37 +403,19 @@ export default function Home() {
               const text = resData.choices?.[0]?.message?.content || resData.choices?.[0]?.text || '';
               responseSnippet = text.trim();
 
-              if (text.includes('ZX-48291') || text.toLowerCase().includes('zx-48291')) {
-                score = 1.0;
-                status = 'passed';
-              } else if (text.includes('ZX') || text.includes('48291')) {
-                score = 0.6;
-                status = 'partial';
-              } else {
-                score = 0.0;
-                status = 'failed';
-              }
+              // Score against the user-configured needle (not a hard-coded one)
+              const verdict = scoreNeedleResponse(text, targetNeedle);
+              score = verdict.score;
+              status = verdict.status;
             } else {
               throw new Error(`HTTP ${res.status}`);
             }
-          } catch (fetchErr) {
-            // Simulated realistic evaluation for large contexts
-            latencyMs = Date.now() - startTime + Math.round(Math.random() * 150) + 250;
-            responseSnippet = `The secret verification code is ${targetNeedle.split('is ')[1] || 'ZX-48291.'}`;
-
-            if (ctx > 128000) {
-              const failureChance = (ctx - 128000) / 100000;
-              const rand = Math.random();
-              if (rand < failureChance * 0.45) {
-                score = 0.0;
-                status = 'failed';
-                responseSnippet = 'I could not locate the verification code in the document.';
-              } else if (rand < failureChance * 0.75) {
-                score = 0.6;
-                status = 'partial';
-                responseSnippet = 'The code is partially mentioned as ZX-...';
-              }
-            }
+          } catch (fetchErr: any) {
+            // Do NOT fabricate results when the endpoint fails: mark the cell
+            // as failed with the underlying error so the heatmap stays honest.
+            score = 0.0;
+            status = 'failed';
+            responseSnippet = `Error: ${fetchErr?.message || 'Request failed'}`;
           }
 
           const cellResult: HeatmapCell = {
