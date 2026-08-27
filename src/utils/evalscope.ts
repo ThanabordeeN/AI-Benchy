@@ -36,6 +36,78 @@ export function computeContextLengths(min: number, max: number, intervals: numbe
   return result;
 }
 
+// ---------------------------------------------------------------------------
+// Built-in NIAH engine (shared by the client loop and the server route)
+// ---------------------------------------------------------------------------
+
+export const FILLER_SENTENCE =
+  'The quick brown fox jumps over the lazy dog and explores the distributed architecture of high performance neural inference runtimes. ';
+
+/**
+ * Builds a haystack of approximately `targetTokens` tokens (~4 chars/token for
+ * English) with the needle inserted at `depthPercent` of the document.
+ * NOTE: this is the built-in lite engine, NOT the official EvalScope corpus.
+ */
+export function generateHaystackWithNeedle(
+  targetTokens: number,
+  depthPercent: number,
+  needle: string
+): string {
+  const totalChars = targetTokens * 4;
+  const sentenceChars = FILLER_SENTENCE.length;
+  const totalSentences = Math.max(1, Math.floor(totalChars / sentenceChars));
+  const insertIndex = Math.min(
+    totalSentences - 1,
+    Math.floor(totalSentences * (depthPercent / 100))
+  );
+
+  const parts: string[] = [];
+  for (let i = 0; i < totalSentences; i++) {
+    if (i === insertIndex) {
+      parts.push(`\n\nImportant Fact: ${needle}\n\n`);
+    }
+    parts.push(FILLER_SENTENCE);
+  }
+
+  // If needle wasn't inserted (e.g. depth 100%)
+  if (insertIndex >= totalSentences - 1 && !parts.some((p) => p.includes(needle))) {
+    parts.push(`\n\nImportant Fact: ${needle}\n\n`);
+  }
+
+  return parts.join(' ');
+}
+
+/**
+ * Scores a model response against the user-configured needle by checking how
+ * many distinctive needle keywords (length > 3, punctuation stripped — hyphens
+ * kept so codes like ZX-48291 survive) appear in the response.
+ */
+export function scoreNeedleResponse(
+  text: string,
+  needle: string
+): { score: number; status: 'passed' | 'partial' | 'failed'; foundCount: number; totalKeywords: number } {
+  const keywords = needle
+    .replace(/[.,\/#!$%\^&\*;:{}=_`~()]/g, '')
+    .split(/\s+/)
+    .filter((w) => w.length > 3);
+
+  if (keywords.length === 0) {
+    // Degenerate needle (no distinctive keywords): fall back to substring match
+    const found = text.toLowerCase().includes(needle.trim().toLowerCase());
+    return { score: found ? 1.0 : 0.0, status: found ? 'passed' : 'failed', foundCount: found ? 1 : 0, totalKeywords: 1 };
+  }
+
+  const foundCount = keywords.filter((k) => text.toLowerCase().includes(k.toLowerCase())).length;
+
+  if (foundCount === keywords.length) {
+    return { score: 1.0, status: 'passed', foundCount, totalKeywords: keywords.length };
+  }
+  if (foundCount > 0) {
+    return { score: 0.6, status: 'partial', foundCount, totalKeywords: keywords.length };
+  }
+  return { score: 0.0, status: 'failed', foundCount, totalKeywords: keywords.length };
+}
+
 export function computeDepthPercents(min: number, max: number, intervals: number): number[] {
   if (intervals <= 1) return [min];
   const step = (max - min) / (intervals - 1);
@@ -47,8 +119,8 @@ export function computeDepthPercents(min: number, max: number, intervals: number
 }
 
 export function generateEvalScopePythonScript(config: EvalScopeConfig): string {
-  const needlesStr = JSON.stringify(config.datasetArgs.needles, null, 20)
-    .replace(/^ +/gm, (match) => ' '.repeat(match.length));
+  const pyStr = (s: string) => s.replace(/"/g, '\\"');
+  const judgeApiKey = config.apiKey || 'EMPTY';
 
   return `from evalscope import TaskConfig, run_task
 
@@ -66,7 +138,7 @@ task_cfg = TaskConfig(
         "needle_haystack": {
             "subset_list": ["${config.datasetArgs.subsetList.join('", "')}"],
             "extra_params": {
-                "retrieval_question": "${config.datasetArgs.retrievalQuestion}",
+                "retrieval_question": "${pyStr(config.datasetArgs.retrievalQuestion)}",
                 "needles": ${JSON.stringify(config.datasetArgs.needles, null, 20)},
 
                 "context_lengths_min": ${config.datasetArgs.contextLengthsMin},
@@ -89,6 +161,17 @@ task_cfg = TaskConfig(
     },
 
     eval_batch_size=${config.evalBatchSize},
+
+    # ⚠️ EvalScope NIAH scoring requires a judge model. This script reuses the
+    # target endpoint as judge — point it at a separate strong model endpoint
+    # if your endpoint only serves the model under test.
+    judge={
+        "models": {
+            "model_id": "${config.model}",
+            "api_url": "${config.apiUrl}",
+            "api_key": "${judgeApiKey}",
+        }
+    },
 )
 
 if __name__ == "__main__":

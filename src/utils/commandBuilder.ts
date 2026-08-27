@@ -55,7 +55,9 @@ export function buildCliArgs(config: BenchmarkConfig): string[] {
     args.push('--concurrency', ...config.concurrency.map(String));
   }
 
-  if (config.latencyMode && config.latencyMode !== 'generation') {
+  // NOTE: llama-benchy's default latency mode is 'api', so we only pass the
+  // flag when the user picked something different from that default.
+  if (config.latencyMode && config.latencyMode !== 'api') {
     args.push('--latency-mode', config.latencyMode);
   }
 
@@ -79,9 +81,10 @@ export function buildCliArgs(config: BenchmarkConfig): string[] {
     args.push('--book-url', config.bookUrl.trim());
   }
 
-  if (config.datasetFile && config.datasetFile.trim()) {
-    args.push('--dataset-file', config.datasetFile.trim());
-  }
+  // NOTE: llama-benchy does not implement --dataset-file, --sample-interval or
+  // --verbose; sending them makes argparse abort with "unrecognized arguments".
+  // Those config fields are kept for backward compatibility with saved sessions
+  // but are intentionally NOT forwarded to the CLI.
 
   if (config.outputFormat && config.outputFormat !== 'md') {
     args.push('--format', config.outputFormat);
@@ -99,20 +102,12 @@ export function buildCliArgs(config: BenchmarkConfig): string[] {
     args.push('--save-all-throughput-timeseries');
   }
 
-  if (config.sampleInterval && config.sampleInterval !== 1.0) {
-    args.push('--sample-interval', String(config.sampleInterval));
-  }
-
   if (config.exitOnFirstFail) {
     args.push('--exit-on-first-fail');
   }
 
   if (config.noResultsOnFail) {
     args.push('--no-results-on-fail');
-  }
-
-  if (config.verbose) {
-    args.push('--verbose');
   }
 
   if (config.postRunCmd && config.postRunCmd.trim()) {
@@ -249,8 +244,6 @@ export function parseCliStringToConfig(cliString: string, baseConfig: BenchmarkC
       parsed.latencyMode = tokens[++i] as any;
     } else if (token === '--book-url' && tokens[i + 1]) {
       parsed.bookUrl = tokens[++i];
-    } else if (token === '--dataset-file' && tokens[i + 1]) {
-      parsed.datasetFile = tokens[++i];
     } else if (token === '--format' && tokens[i + 1]) {
       parsed.outputFormat = tokens[++i] as any;
     } else if (token === '--save-result' && tokens[i + 1]) {
@@ -263,8 +256,8 @@ export function parseCliStringToConfig(cliString: string, baseConfig: BenchmarkC
       parsed.exitOnFirstFail = true;
     } else if (token === '--no-results-on-fail') {
       parsed.noResultsOnFail = true;
-    } else if (token === '--verbose') {
-      parsed.verbose = true;
+    // NOTE: --dataset-file, --sample-interval and --verbose do not exist in
+    // llama-benchy and are intentionally not parsed here.
     } else if (token === '--post-run-cmd' && tokens[i + 1]) {
       parsed.postRunCmd = tokens[++i].replace(/^"|"$/g, '');
     } else if (token === '--extra-body' && tokens[i + 1]) {

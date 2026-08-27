@@ -1,6 +1,6 @@
 import { BenchmarkConfig, ProgressEvent, BenchmarkResultRow } from '@/types/benchmark';
 import { buildCliArgs } from '@/utils/commandBuilder';
-import { parseLlamaBenchMarkdown } from '@/utils/formatters';
+import { benchyTestName, buildTotalThroughputTimeseries } from '@/utils/formatters';
 
 declare global {
   interface Window {
@@ -44,7 +44,12 @@ export async function runNeutralinoBenchmark(
     event: 'start',
     timestamp: new Date().toISOString(),
     message: `[Native Engine] Spawning llama-benchy directly on local OS...`,
-    totalTests: (config.pp.length + config.tg.length) * config.depth.length * config.concurrency.length,
+    // llama-benchy runs the cartesian matrix pp × tg × depth × concurrency
+    totalTests:
+      (config.pp.length || 1) *
+      (config.tg.length || 1) *
+      (config.depth.length || 1) *
+      (config.concurrency.length || 1),
   });
 
   try {
@@ -58,9 +63,13 @@ export async function runNeutralinoBenchmark(
     let activeConcurrency = config.concurrency[0] || 1;
     let activeTestName = `pp${activePp}`;
     let activeTtfrMs: number | undefined;
+    let activeE2eTtftMs: number | undefined;
     let activeTokenCount = 0;
     let decodeStartTime = 0;
     let activePpTps = 0;
+
+    // Token-chunk timestamps → total-throughput timeseries for charts
+    const tokenEvents: { ts: number; count: number }[] = [];
 
     // Listen to native process output stream
     const onProcessEvent = (evt: any) => {
@@ -74,6 +83,7 @@ export async function runNeutralinoBenchmark(
           event: 'complete',
           timestamp: new Date().toISOString(),
           message: `Benchmark process completed (Exit Code: ${exitCode}).`,
+          timeseries: buildTotalThroughputTimeseries(tokenEvents),
         });
         return;
       }
@@ -99,8 +109,9 @@ export async function runNeutralinoBenchmark(
               activeTg = parsed.response_size ?? (parsed.test?.tg || config.tg[0] || 128);
               activeDepth = parsed.context_size ?? (parsed.test?.depth || 0);
               activeConcurrency = parsed.concurrency || 1;
-              activeTestName = activeDepth > 0 ? `pp${activePp} @ d${activeDepth}` : `pp${activePp}`;
+              activeTestName = benchyTestName('pp', activePp, activeDepth, activeConcurrency);
               activeTtfrMs = undefined;
+              activeE2eTtftMs = undefined;
               activeTokenCount = 0;
               decodeStartTime = 0;
 
@@ -113,38 +124,48 @@ export async function runNeutralinoBenchmark(
             }
 
             if (evtType === 'request_first_response' || evtType === 'request_first_token') {
-              const ttfrSec = parsed.ttfr_s ?? parsed.ttft_s ?? parsed.ttfr ?? 0;
-              activeTtfrMs = ttfrSec * 1000;
-              decodeStartTime = Date.now();
+              // ttfr = time to first response chunk, ttft = time to first
+              // content token (e2e_ttft upstream). est_ppt = ttfr − latency;
+              // latency is unknown here so we keep the raw ttfr as estimate.
+              const ttfrSec = parsed.ttfr_s ?? 0;
+              const ttftSec = parsed.ttft_s ?? 0;
+              if (parsed.ttfr_s !== undefined) activeTtfrMs = ttfrSec * 1000;
+              if (parsed.ttft_s !== undefined) activeE2eTtftMs = ttftSec * 1000;
+              if (evtType === 'request_first_token') {
+                decodeStartTime = Date.now();
+              }
               const totalPromptTokens = activePp + activeDepth;
-              activePpTps = ttfrSec > 0 ? totalPromptTokens / ttfrSec : 0;
+              const estPptMs = activeTtfrMs !== undefined ? Math.max(0, activeTtfrMs) : undefined;
+              activePpTps = estPptMs && estPptMs > 0 ? totalPromptTokens / (estPptMs / 1000) : 0;
 
               const liveRow: BenchmarkResultRow = {
                 id: `${activeTestName}-${Date.now()}`,
                 model: config.model,
                 test: activeTestName,
                 pp: activePp,
-                tg: activeTg,
+                tg: 0,
                 depth: activeDepth,
                 concurrency: activeConcurrency,
                 tps: activePpTps,
-                peakTps: activePpTps,
                 ttfrMs: activeTtfrMs,
-                estPptMs: activeTtfrMs,
-                e2eTtftMs: activeTtfrMs,
+                estPptMs,
+                e2eTtftMs: activeE2eTtftMs,
               };
 
               onEvent({
                 event: 'live_metric',
                 timestamp: new Date().toISOString(),
                 liveRow,
-                message: `[Prefill Done] ${activeTestName} • TTFR: ${activeTtfrMs.toFixed(1)}ms (${activePpTps.toFixed(1)} t/s)`,
+                message: `[Prefill] ${activeTestName} • TTFR: ${(activeTtfrMs ?? 0).toFixed(1)}ms${activePpTps > 0 ? ` (${activePpTps.toFixed(1)} t/s)` : ''}`,
               });
               continue;
             }
 
             if (evtType === 'tokens') {
               activeTokenCount += parsed.count || 1;
+              if (typeof parsed.ts === 'number') {
+                tokenEvents.push({ ts: parsed.ts, count: parsed.count || 1 });
+              }
               const now = Date.now();
               const decodeDurationSec = decodeStartTime > 0 ? (now - decodeStartTime) / 1000 : 0.001;
               const liveTgTps = decodeDurationSec > 0 ? activeTokenCount / decodeDurationSec : 0;
@@ -152,14 +173,12 @@ export async function runNeutralinoBenchmark(
               const liveRow: BenchmarkResultRow = {
                 id: `tg-${activeTestName}-${Date.now()}`,
                 model: config.model,
-                test: `tg${activeTg}`,
-                pp: activePp,
-                tg: activeTokenCount,
+                test: benchyTestName('tg', activeTg, activeDepth, activeConcurrency),
+                pp: 0,
+                tg: activeTg,
                 depth: activeDepth,
                 concurrency: activeConcurrency,
                 tps: liveTgTps,
-                peakTps: liveTgTps,
-                ttfrMs: activeTtfrMs,
               };
 
               onEvent({
@@ -179,13 +198,12 @@ export async function runNeutralinoBenchmark(
               const liveRow: BenchmarkResultRow = {
                 id: `tg-${activeTestName}-${Date.now()}`,
                 model: config.model,
-                test: `tg${activeTg}`,
-                pp: activePp,
-                tg: totalTokens,
+                test: benchyTestName('tg', activeTg, activeDepth, activeConcurrency),
+                pp: 0,
+                tg: activeTg,
                 depth: activeDepth,
                 concurrency: activeConcurrency,
                 tps: finalTgTps,
-                peakTps: finalTgTps,
                 ttfrMs: activeTtfrMs,
               };
 
@@ -203,6 +221,7 @@ export async function runNeutralinoBenchmark(
                 event: 'complete',
                 timestamp: new Date().toISOString(),
                 message: 'Benchmark completed successfully.',
+                timeseries: buildTotalThroughputTimeseries(tokenEvents),
               });
               continue;
             }
@@ -211,22 +230,7 @@ export async function runNeutralinoBenchmark(
           } catch {}
         }
 
-        // 2. Parse Markdown Table rows from stdout
-        if (trimmed.includes('|') && !trimmed.includes('---') && !trimmed.includes('model | test')) {
-          const parsedRows = parseLlamaBenchMarkdown(trimmed);
-          if (parsedRows.length > 0) {
-            for (const row of parsedRows) {
-              onEvent({
-                event: 'run_complete',
-                timestamp: new Date().toISOString(),
-                data: row,
-                message: `[Row Ready] ${row.test}: ${row.tps.toFixed(1)} t/s`,
-              });
-            }
-          }
-        }
-
-        // 3. Regular console logs
+        // 2. Regular console logs
         onEvent({
           event: 'stdout',
           timestamp: new Date().toISOString(),
